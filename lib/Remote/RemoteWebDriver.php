@@ -58,7 +58,7 @@ class RemoteWebDriver implements WebDriver, JavaScriptExecutor, WebDriverHasInpu
      * @param bool $isW3cCompliant false to use the legacy JsonWire protocol, true for the W3C WebDriver spec
      */
     protected function __construct(
-        HttpCommandExecutor $commandExecutor,
+        WebDriverCommandExecutor $commandExecutor,
         $sessionId,
         WebDriverCapabilities $capabilities,
         $isW3cCompliant = false
@@ -67,6 +67,26 @@ class RemoteWebDriver implements WebDriver, JavaScriptExecutor, WebDriverHasInpu
         $this->sessionID = $sessionId;
         $this->isW3cCompliant = $isW3cCompliant;
         $this->capabilities = $capabilities;
+    }
+
+    /**
+     * Creates a driver backed by an arbitrary command executor.
+     *
+     * This is the seam that lets a transport other than HTTP-to-chromedriver -
+     * a CDP executor, a fake in tests - drive the full RemoteWebDriver API.
+     *
+     * @param string $sessionId
+     * @param bool $isW3cCompliant
+     *
+     * @return static
+     */
+    public static function createByCommandExecutor(
+        WebDriverCommandExecutor $commandExecutor,
+        $sessionId,
+        WebDriverCapabilities $capabilities,
+        $isW3cCompliant = true
+    ) {
+        return new static($commandExecutor, $sessionId, $capabilities, $isW3cCompliant);
     }
 
     /**
@@ -342,7 +362,7 @@ class RemoteWebDriver implements WebDriver, JavaScriptExecutor, WebDriverHasInpu
             'args' => $this->prepareScriptArguments($arguments),
         ];
 
-        return $this->execute(DriverCommand::EXECUTE_SCRIPT, $params);
+        return $this->castScriptResult($this->execute(DriverCommand::EXECUTE_SCRIPT, $params));
     }
 
     /**
@@ -364,10 +384,10 @@ class RemoteWebDriver implements WebDriver, JavaScriptExecutor, WebDriverHasInpu
             'args' => $this->prepareScriptArguments($arguments),
         ];
 
-        return $this->execute(
+        return $this->castScriptResult($this->execute(
             DriverCommand::EXECUTE_ASYNC_SCRIPT,
             $params
-        );
+        ));
     }
 
     /**
@@ -672,6 +692,34 @@ class RemoteWebDriver implements WebDriver, JavaScriptExecutor, WebDriverHasInpu
      *
      * @return array
      */
+    /**
+     * Turns element handles in a script result back into element objects.
+     *
+     * Scripts may return elements at any depth - bare, or nested in arrays - and
+     * callers expect objects they can act on, mirroring prepareScriptArguments()
+     * on the way in.
+     *
+     * @param mixed $result
+     *
+     * @return mixed
+     */
+    protected function castScriptResult($result)
+    {
+        if (is_array($result)) {
+            $identifier = $this->isW3cCompliant ? JsonWireCompat::WEB_DRIVER_ELEMENT_IDENTIFIER : 'ELEMENT';
+
+            if (array_key_exists($identifier, $result)) {
+                return $this->newElement($result[$identifier]);
+            }
+
+            foreach ($result as $key => $value) {
+                $result[$key] = $this->castScriptResult($value);
+            }
+        }
+
+        return $result;
+    }
+
     protected function prepareScriptArguments(array $arguments)
     {
         $args = [];
