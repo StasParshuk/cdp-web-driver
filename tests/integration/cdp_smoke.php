@@ -102,6 +102,51 @@ echo "\nwindows & screenshot\n";
 $check('getWindowHandles', count($driver->getWindowHandles()) >= 1);
 $check('screenshot bytes', strlen((string) $driver->takeScreenshot()) > 1000);
 
+echo "\nxpath\n";
+$driver->get('https://example.com');
+$check('xpath absolute', $driver->findElement(WebDriverBy::xpath('//h1'))->getText(), 'Example Domain');
+$check('xpath findElements', count($driver->findElements(WebDriverBy::xpath('//a'))) > 0);
+// Shapes the bot actually uses: ancestor::, local-name(), union, substring-before().
+$check('xpath ancestor axis', $driver->findElement(WebDriverBy::xpath('//h1/ancestor::body'))->getTagName(), 'body');
+$check('xpath union', count($driver->findElements(WebDriverBy::xpath('//h1 | //a'))) >= 2);
+$check('xpath substring-before', count($driver->findElements(WebDriverBy::xpath('//a[substring-before(@href, ":") = "https"]'))) > 0);
+$check('xpath local-name', count($driver->findElements(WebDriverBy::xpath('//*[local-name() = "h1"]'))) === 1);
+// Relative xpath resolved against a context element.
+$body = $driver->findElement(WebDriverBy::cssSelector('body'));
+$check('xpath relative in element', $body->findElement(WebDriverBy::xpath('.//h1'))->getText(), 'Example Domain');
+$check('xpath no match throws', (static function () use ($driver): bool {
+    try {
+        $driver->findElement(WebDriverBy::xpath('//nonexistent-tag'));
+
+        return false;
+    } catch (Facebook\WebDriver\Exception\NoSuchElementException) {
+        return true;
+    }
+})());
+
+echo "\nperformance log\n";
+$driver->get('https://example.com');
+$logs = $driver->manage()->getLog('performance');
+$check('log entries collected', count($logs) > 0);
+$hasRequest = false;
+foreach ($logs as $entry) {
+    $message = json_decode((string) $entry['message'], true, 512, JSON_THROW_ON_ERROR);
+    if (($message['message']['method'] ?? '') === 'Network.requestWillBeSent') {
+        $hasRequest = $hasRequest || ($message['message']['params']['request']['url'] ?? '') !== '';
+    }
+}
+$check('requestWillBeSent with url', $hasRequest);
+
+echo "\nfile upload\n";
+$upload = tempnam(sys_get_temp_dir(), 'cdp') . '.txt';
+file_put_contents($upload, 'cdp upload test');
+$driver->executeScript('document.body.innerHTML = \'<input type="file" id="f">\';');
+$fileInput = $driver->findElement(WebDriverBy::cssSelector('#f'));
+$fileInput->setFileDetector(new Facebook\WebDriver\Remote\LocalFileDetector());
+$fileInput->sendKeys($upload);
+$check('file name set on input', $driver->executeScript('return document.querySelector("#f").files[0]?.name ?? "";') !== '');
+unlink($upload);
+
 echo "\nstealth injection (Page.addScriptToEvaluateOnNewDocument)\n";
 // Exactly how the bot ships its evasions - through a raw CDP custom command.
 $driver->executeCustomCommand('/session/:sessionId/goog/cdp/execute', 'POST', [

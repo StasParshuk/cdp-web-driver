@@ -125,6 +125,57 @@ class CdpClient
     }
 
     /**
+     * Pulls buffered events whose method starts with the given prefix, leaving
+     * everything else in the buffer.
+     *
+     * @return list<array<string, mixed>>
+     */
+    public function drainEventsByPrefix(string $prefix, ?string $sessionId = null): array
+    {
+        $matched = [];
+        $rest = [];
+
+        foreach ($this->pendingEvents as $event) {
+            $isMatch = isset($event['method'])
+                && str_starts_with((string) $event['method'], $prefix)
+                && ($sessionId === null || ($event['sessionId'] ?? null) === $sessionId);
+
+            if ($isMatch) {
+                $matched[] = $event;
+            } else {
+                $rest[] = $event;
+            }
+        }
+
+        $this->pendingEvents = $rest;
+
+        return $matched;
+    }
+
+    /**
+     * Reads whatever frames are already waiting on the socket without blocking,
+     * so buffered events reflect what the browser has sent so far.
+     */
+    public function pump(float $seconds = 0.05): void
+    {
+        $deadline = microtime(true) + $seconds;
+
+        while (microtime(true) < $deadline) {
+            $frame = $this->readFrame(max(0.01, $deadline - microtime(true)));
+
+            if ($frame === null) {
+                return;
+            }
+
+            $decoded = json_decode($frame, true, 512, JSON_THROW_ON_ERROR);
+
+            if (isset($decoded['method'])) {
+                $this->pendingEvents[] = $decoded;
+            }
+        }
+    }
+
+    /**
      * @param array<string, mixed> $event
      */
     private function eventMatches(array $event, ?string $method, ?string $sessionId): bool

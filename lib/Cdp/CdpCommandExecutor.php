@@ -125,6 +125,9 @@ class CdpCommandExecutor implements WebDriverCommandExecutor
             DriverCommand::ADD_COOKIE => $this->addCookie($parameters),
             DriverCommand::DELETE_ALL_COOKIES => $this->deleteAllCookies(),
             DriverCommand::DELETE_COOKIE => $this->deleteCookie($parameters),
+            DriverCommand::GET_LOG => $this->getLog($parameters),
+            DriverCommand::GET_AVAILABLE_LOG_TYPES => ['performance'],
+            DriverCommand::UPLOAD_FILE => $this->uploadFile($parameters),
             DriverCommand::SET_TIMEOUT, DriverCommand::IMPLICITLY_WAIT => null,
             DriverCommand::ACTIONS => $this->performActions($parameters),
             DriverCommand::CUSTOM_COMMAND => $this->customCommand($parameters),
@@ -390,7 +393,9 @@ class CdpCommandExecutor implements WebDriverCommandExecutor
      */
     private function findElement(array $parameters): array
     {
-        $objectId = $this->getSession()->querySelector($this->toCssSelector($parameters));
+        $objectId = $this->isXPath($parameters)
+            ? $this->getSession()->queryXPath($this->locatorValue($parameters))
+            : $this->getSession()->querySelector($this->locatorValue($parameters));
 
         return [self::ELEMENT_IDENTIFIER => $this->elements->store($objectId)];
     }
@@ -402,9 +407,11 @@ class CdpCommandExecutor implements WebDriverCommandExecutor
      */
     private function findElements(array $parameters): array
     {
-        return $this->wrapElements(
-            $this->getSession()->querySelectorAll($this->toCssSelector($parameters)),
-        );
+        $session = $this->getSession();
+
+        return $this->wrapElements($this->isXPath($parameters)
+            ? $session->queryXPathAll($this->locatorValue($parameters))
+            : $session->querySelectorAll($this->locatorValue($parameters)));
     }
 
     /**
@@ -414,10 +421,12 @@ class CdpCommandExecutor implements WebDriverCommandExecutor
      */
     private function findChildElement(array $parameters): array
     {
-        $objectId = $this->getSession()->querySelector(
-            $this->toCssSelector($parameters),
-            $this->objectIdFrom($parameters),
-        );
+        $session = $this->getSession();
+        $context = $this->objectIdFrom($parameters);
+
+        $objectId = $this->isXPath($parameters)
+            ? $session->queryXPath($this->locatorValue($parameters), $context)
+            : $session->querySelector($this->locatorValue($parameters), $context);
 
         return [self::ELEMENT_IDENTIFIER => $this->elements->store($objectId)];
     }
@@ -429,10 +438,12 @@ class CdpCommandExecutor implements WebDriverCommandExecutor
      */
     private function findChildElements(array $parameters): array
     {
-        return $this->wrapElements($this->getSession()->querySelectorAll(
-            $this->toCssSelector($parameters),
-            $this->objectIdFrom($parameters),
-        ));
+        $session = $this->getSession();
+        $context = $this->objectIdFrom($parameters);
+
+        return $this->wrapElements($this->isXPath($parameters)
+            ? $session->queryXPathAll($this->locatorValue($parameters), $context)
+            : $session->querySelectorAll($this->locatorValue($parameters), $context));
     }
 
     /**
@@ -471,24 +482,31 @@ class CdpCommandExecutor implements WebDriverCommandExecutor
     }
 
     /**
-     * php-webdriver normalises id/name/class-name selectors to CSS before they
-     * reach the executor; anything left that is not CSS or XPath we cannot map.
+     * php-webdriver normalises id/name/class-name locators to CSS before they
+     * reach the executor, so only CSS and XPath can arrive here.
      *
      * @param array<string, mixed> $parameters
      */
-    private function toCssSelector(array $parameters): string
+    private function isXPath(array $parameters): bool
     {
         $using = (string) ($parameters['using'] ?? 'css selector');
-        $value = (string) ($parameters['value'] ?? '');
 
-        if ($using === 'css selector') {
-            return $value;
-        }
+        return match ($using) {
+            'xpath' => true,
+            'css selector' => false,
+            default => throw new UnsupportedOperationException(sprintf(
+                'Locator strategy "%s" is not supported by the CDP executor.',
+                $using,
+            )),
+        };
+    }
 
-        throw new UnsupportedOperationException(sprintf(
-            'Locator strategy "%s" is not supported by the CDP executor; use a CSS selector.',
-            $using,
-        ));
+    /**
+     * @param array<string, mixed> $parameters
+     */
+    private function locatorValue(array $parameters): string
+    {
+        return (string) ($parameters['value'] ?? '');
     }
 
     /**
@@ -756,6 +774,12 @@ class CdpCommandExecutor implements WebDriverCommandExecutor
     private function sendKeys(array $parameters): null
     {
         $session = $this->getSession();
+
+        // Typing into a file input does nothing; the path has to be set through
+        // the DOM domain instead.
+        if ($this->isFileInput($parameters)) {
+            return $this->setFileInputFiles($parameters);
+        }
 
         $this->callOnElement($parameters, 'function () { this.focus(); }');
 
@@ -1131,5 +1155,101 @@ class CdpCommandExecutor implements WebDriverCommandExecutor
         }
 
         return $this->getSession()->send($method, (array) ($parameters['params'] ?? []));
+    }
+
+    // --- logs & file upload ------------------------------------------------
+
+    /**
+     * Replays buffered CDP network events as chromedriver-shaped log entries,
+     * which is what the Sales Navigator request tracker parses.
+     *
+     * @param array<string, mixed> $parameters
+     *
+     * @return list<array<string, mixed>>
+     */
+    private function getLog(array $parameters): array
+    {
+        $type = (string) ($parameters['type'] ?? 'performance');
+
+        if ($type !== 'performance') {
+            throw new UnsupportedOperationException(sprintf(
+                'Log type "%s" is not supported by the CDP executor; only "performance" is.',
+                $type,
+            ));
+        }
+
+        return $this->getSession()->takePerformanceLog();
+    }
+
+    /**
+     * WebDriver uploads a zipped file and expects a path back that sendKeys can
+     * feed to a file input. There is no such round trip in CDP, so we unpack the
+     * archive locally and hand the path to DOM.setFileInputFiles later.
+     *
+     * @param array<string, mixed> $parameters
+     */
+    private function uploadFile(array $parameters): string
+    {
+        $encoded = (string) ($parameters['file'] ?? '');
+        $archive = base64_decode($encoded, true);
+
+        if ($archive === false) {
+            throw new WebDriverException('Uploaded file is not valid base64 data');
+        }
+
+        $directory = sprintf('%s/cdp-upload-%s', sys_get_temp_dir(), bin2hex(random_bytes(6)));
+
+        if (!mkdir($directory, 0700, true) && !is_dir($directory)) {
+            throw new WebDriverException(sprintf('Cannot create upload directory %s', $directory));
+        }
+
+        $archivePath = sprintf('%s/upload.zip', $directory);
+        file_put_contents($archivePath, $archive);
+
+        $zip = new \ZipArchive();
+
+        if ($zip->open($archivePath) !== true) {
+            throw new WebDriverException('Cannot open the uploaded zip archive');
+        }
+
+        $firstEntry = $zip->getNameIndex(0);
+        $zip->extractTo($directory);
+        $zip->close();
+        unlink($archivePath);
+
+        if ($firstEntry === false) {
+            throw new WebDriverException('Uploaded archive is empty');
+        }
+
+        return sprintf('%s/%s', $directory, $firstEntry);
+    }
+
+    /**
+     * @param array<string, mixed> $parameters
+     */
+    private function isFileInput(array $parameters): bool
+    {
+        return (bool) $this->callOnElement(
+            $parameters,
+            'function () { return this.tagName === "INPUT" && this.type === "file"; }',
+        );
+    }
+
+    /**
+     * @param array<string, mixed> $parameters
+     */
+    private function setFileInputFiles(array $parameters): null
+    {
+        $paths = array_values(array_filter(
+            array_map('trim', explode("\n", implode('', $this->collectKeys($parameters)))),
+            static fn (string $path): bool => $path !== '',
+        ));
+
+        $this->getSession()->send('DOM.setFileInputFiles', [
+            'files' => $paths,
+            'objectId' => $this->objectIdFrom($parameters),
+        ]);
+
+        return null;
     }
 }

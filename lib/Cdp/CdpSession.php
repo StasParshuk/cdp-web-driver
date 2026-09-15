@@ -26,6 +26,13 @@ class CdpSession
     /** Frame the driver currently addresses; null means the top-level document. */
     private ?string $currentFrameId = null;
 
+    /**
+     * Network events seen so far, in chromedriver's performance-log shape.
+     *
+     * @var list<array{message: string}>
+     */
+    private array $performanceLog = [];
+
     public function __construct(private readonly CdpClient $client, ?string $targetId = null)
     {
         if ($targetId === null) {
@@ -91,6 +98,46 @@ class CdpSession
     public function awaitLoad(float $timeout = self::NAVIGATION_TIMEOUT): void
     {
         $this->client->waitForEvent('Page.loadEventFired', $timeout, $this->sessionId);
+        $this->collectPerformanceEvents();
+    }
+
+    /**
+     * Drains buffered network events in the shape chromedriver's performance log
+     * uses: one entry per event, the CDP message JSON-encoded under 'message'.
+     *
+     * @return list<array{message: string, level: string, timestamp: int}>
+     */
+    public function takePerformanceLog(): array
+    {
+        $this->collectPerformanceEvents();
+
+        $entries = $this->performanceLog;
+        $this->performanceLog = [];
+
+        return $entries;
+    }
+
+    private function collectPerformanceEvents(): void
+    {
+        // Pick up anything the browser pushed since the last command, then take
+        // only Network events - Page events are still needed by awaitLoad().
+        $this->client->pump();
+
+        foreach ($this->client->drainEventsByPrefix('Network.', $this->sessionId) as $event) {
+            $method = (string) ($event['method'] ?? '');
+
+            $this->performanceLog[] = [
+                'message' => json_encode([
+                    'message' => [
+                        'method' => $method,
+                        'params' => $event['params'] ?? [],
+                    ],
+                    'webview' => $this->targetId,
+                ], JSON_THROW_ON_ERROR),
+                'level' => 'INFO',
+                'timestamp' => (int) (microtime(true) * 1000),
+            ];
+        }
     }
 
     public function getCurrentUrl(): string
@@ -195,6 +242,93 @@ class CdpSession
     }
 
     /**
+     * XPath counterpart of querySelector().
+     *
+     * document.evaluate resolves a relative expression against its context node,
+     * which is what WebDriver expects when searching inside an element.
+     *
+     * @throws NoSuchElementException
+     */
+    public function queryXPath(string $expression, ?string $contextObjectId = null): string
+    {
+        $declaration = 'function (expression) {
+            var result = document.evaluate(
+                expression,
+                this,
+                null,
+                XPathResult.FIRST_ORDERED_NODE_TYPE,
+                null
+            );
+
+            return result.singleNodeValue;
+        }';
+
+        $result = $this->callFunctionOn(
+            $declaration,
+            $contextObjectId ?? $this->getDocumentObjectId(),
+            [['value' => $expression]],
+            false,
+        );
+
+        if (!isset($result['objectId'])) {
+            throw new NoSuchElementException(sprintf('No such element by xpath: %s', $expression));
+        }
+
+        return (string) $result['objectId'];
+    }
+
+    /**
+     * @return list<string> CDP object ids
+     */
+    public function queryXPathAll(string $expression, ?string $contextObjectId = null): array
+    {
+        $declaration = 'function (expression) {
+            var snapshot = document.evaluate(
+                expression,
+                this,
+                null,
+                XPathResult.ORDERED_NODE_SNAPSHOT_TYPE,
+                null
+            );
+
+            var nodes = [];
+
+            for (var i = 0; i < snapshot.snapshotLength; i++) {
+                nodes.push(snapshot.snapshotItem(i));
+            }
+
+            return nodes;
+        }';
+
+        $arrayObject = $this->callFunctionOn(
+            $declaration,
+            $contextObjectId ?? $this->getDocumentObjectId(),
+            [['value' => $expression]],
+            false,
+        );
+
+        if (!isset($arrayObject['objectId'])) {
+            return [];
+        }
+
+        return $this->collectArrayObjectIds((string) $arrayObject['objectId']);
+    }
+
+    /**
+     * Document handle to evaluate absolute expressions against.
+     */
+    private function getDocumentObjectId(): string
+    {
+        $document = $this->evaluate('document', false);
+
+        if (!isset($document['objectId'])) {
+            throw new WebDriverException('Cannot obtain a handle on the document');
+        }
+
+        return (string) $document['objectId'];
+    }
+
+    /**
      * @return list<string> CDP object ids
      */
     public function querySelectorAll(string $selector, ?string $contextObjectId = null): array
@@ -212,8 +346,18 @@ class CdpSession
             return [];
         }
 
+        return $this->collectArrayObjectIds((string) $arrayObject['objectId']);
+    }
+
+    /**
+     * Reads the element handles out of a remote array and releases it.
+     *
+     * @return list<string>
+     */
+    private function collectArrayObjectIds(string $arrayObjectId): array
+    {
         $properties = $this->send('Runtime.getProperties', [
-            'objectId' => $arrayObject['objectId'],
+            'objectId' => $arrayObjectId,
             'ownProperties' => true,
         ]);
 
@@ -229,7 +373,7 @@ class CdpSession
             }
         }
 
-        $this->releaseObject($arrayObject['objectId']);
+        $this->releaseObject($arrayObjectId);
 
         return $objectIds;
     }
